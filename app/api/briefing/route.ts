@@ -13,6 +13,11 @@ type GeminiResponse = {
       }>;
     };
   }>;
+  error?: {
+    code?: number;
+    message?: string;
+    status?: string;
+  };
 };
 
 const BRIEFING_TEMPLATE = `📋 LEAD BRIEFING - NOME
@@ -52,48 +57,54 @@ Observações/alertas SDR:
 ${alerts?.trim() || "Não informado"}`;
 }
 
-async function generateBriefingWithGemini(model: string, apiKey: string, prompt: string) {
+async function generateBriefingWithGemini(apiKey: string, prompt: string) {
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
       },
       body: JSON.stringify({
-        systemInstruction: {
-          parts: [
-            {
-              text: "Você transforma formulários brutos de leads em briefings SDR objetivos, em português do Brasil. Preserve apenas informações úteis para prospecção.",
-            },
-          ],
-        },
         contents: [
           {
             role: "user",
             parts: [{ text: prompt }],
           },
         ],
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 1200,
-        },
       }),
     },
   );
 
+  const data = (await response.json()) as GeminiResponse;
+
   if (!response.ok) {
-    return { briefing: "", status: response.status };
+    console.error("Gemini API error", {
+      status: response.status,
+      statusText: response.statusText,
+      error: data.error,
+    });
+
+    return {
+      briefing: "",
+      error:
+        data.error?.message ??
+        `Gemini retornou erro ${response.status} ${response.statusText}.`,
+      status: response.status,
+    };
   }
 
-  const data = (await response.json()) as GeminiResponse;
-  const briefing = data.candidates?.[0]?.content?.parts
-    ?.map((part) => part.text ?? "")
-    .join("")
-    .trim();
+  const briefing = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
 
-  return { briefing: briefing ?? "", status: response.status };
+  if (!briefing) {
+    console.error("Gemini API empty response", { status: response.status, data });
+  }
+
+  return {
+    briefing: briefing ?? "",
+    error: briefing ? "" : "Gemini retornou uma resposta vazia ou em formato inesperado.",
+    status: response.status,
+  };
 }
 
 export async function POST(request: Request) {
@@ -117,31 +128,27 @@ export async function POST(request: Request) {
     }
 
     const prompt = buildPrompt(leadText, alerts);
-    const preferredModel = process.env.AI_MODEL?.trim() || "gemini-2.0-flash";
-    const models = Array.from(new Set([preferredModel, "gemini-1.5-flash"]));
+    const result = await generateBriefingWithGemini(apiKey, prompt);
 
-    for (const model of models) {
-      const result = await generateBriefingWithGemini(model, apiKey, prompt);
-
-      if (result.briefing) {
-        return NextResponse.json({ briefing: result.briefing });
-      }
-
-      if (result.status !== 404) {
-        return NextResponse.json(
-          { error: "O Gemini não conseguiu gerar o briefing agora." },
-          { status: result.status },
-        );
-      }
+    if (result.briefing) {
+      return NextResponse.json({ briefing: result.briefing });
     }
 
     return NextResponse.json(
-      { error: "Nenhum modelo Gemini configurado está disponível para gerar o briefing." },
-      { status: 502 },
+      {
+        error: "O Gemini não conseguiu gerar o briefing agora.",
+        details: result.error,
+      },
+      { status: result.status || 502 },
     );
-  } catch {
+  } catch (error) {
+    console.error("Briefing route error", error);
+
     return NextResponse.json(
-      { error: "Não foi possível processar o briefing." },
+      {
+        error: "Não foi possível processar o briefing.",
+        details: error instanceof Error ? error.message : "Erro desconhecido.",
+      },
       { status: 500 },
     );
   }
